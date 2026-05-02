@@ -24,6 +24,10 @@ describe("cdpApiClient", () => {
     }) as unknown as Mocked<AxiosInstance>;
 
     mockAxiosInstance.getUri = vi.fn(() => "https://api.cdp.coinbase.com/platform");
+    mockAxiosInstance.interceptors = {
+      request: { use: vi.fn(), eject: vi.fn(), clear: vi.fn() },
+      response: { use: vi.fn(), eject: vi.fn(), clear: vi.fn() },
+    } as any;
 
     (Axios.create as any).mockReturnValue(mockAxiosInstance);
     (Axios.isAxiosError as any) = vi.fn();

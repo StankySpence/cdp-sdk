@@ -185,7 +185,7 @@ describe("SolanaClient", () => {
       const formatSolanaPrivateKeyMock = formatSolanaPrivateKey as MockedFunction<
         typeof formatSolanaPrivateKey
       >;
-      formatSolanaPrivateKeyMock.mockReturnValue(mockFormattedPrivateKey);
+      formatSolanaPrivateKeyMock.mockResolvedValue(mockFormattedPrivateKey);
 
       const exportSolanaAccountMock = CdpOpenApiClient.exportSolanaAccount as MockedFunction<
         typeof CdpOpenApiClient.exportSolanaAccount
@@ -235,7 +235,7 @@ describe("SolanaClient", () => {
       const formatSolanaPrivateKeyMock = formatSolanaPrivateKey as MockedFunction<
         typeof formatSolanaPrivateKey
       >;
-      formatSolanaPrivateKeyMock.mockReturnValue(mockFormattedPrivateKey);
+      formatSolanaPrivateKeyMock.mockResolvedValue(mockFormattedPrivateKey);
 
       const exportSolanaAccountByNameMock =
         CdpOpenApiClient.exportSolanaAccountByName as MockedFunction<
@@ -453,6 +453,30 @@ describe("SolanaClient", () => {
       expect(result).toEqual({
         transactionSignature: "someTransactionSignature",
         signature: "someTransactionSignature",
+      });
+    });
+
+    it("should send a fee-sponsored Solana transaction", async () => {
+      const sendSolanaTransactionMock = CdpOpenApiClient.sendSolanaTransaction as MockedFunction<
+        typeof CdpOpenApiClient.sendSolanaTransaction
+      >;
+      sendSolanaTransactionMock.mockResolvedValue({
+        transactionSignature: "sponsoredTransactionSignature",
+      });
+
+      const result = await client.sendTransaction({
+        network: "solana-devnet",
+        transaction: "someTransaction",
+        useCdpSponsor: true,
+      });
+
+      expect(sendSolanaTransactionMock).toHaveBeenCalledWith(
+        { network: "solana-devnet", transaction: "someTransaction", useCdpSponsor: true },
+        undefined,
+      );
+      expect(result).toEqual({
+        transactionSignature: "sponsoredTransactionSignature",
+        signature: "sponsoredTransactionSignature",
       });
     });
   });

@@ -1,12 +1,18 @@
 import {
-  Connection,
-  Keypair,
-  LAMPORTS_PER_SOL,
-  PublicKey,
-  SYSVAR_RECENT_BLOCKHASHES_PUBKEY,
-  SystemProgram,
-  Transaction,
-} from "@solana/web3.js";
+  address as solanaAddress,
+  appendTransactionMessageInstructions,
+  compileTransaction,
+  createNoopSigner,
+  createSolanaRpc,
+  createTransactionMessage,
+  getBase64EncodedWireTransaction,
+  pipe,
+  setTransactionMessageFeePayer,
+  setTransactionMessageLifetimeUsingBlockhash,
+  type Blockhash,
+  type Signature,
+} from "@solana/kit";
+import { getTransferSolInstruction } from "@solana-program/system";
 import { Abi } from "abitype";
 import bs58 from "bs58";
 import dotenv from "dotenv";
@@ -39,11 +45,33 @@ import type {
 } from "./client/evm/evm.types.js";
 import type { ImportAccountOptions } from "./client/solana/solana.types.js";
 import { TimeoutError } from "./errors.js";
+import { APIError } from "./openapi-client/errors.js";
 import { SignEvmTransactionRule } from "./policies/evmSchema.js";
 import type { CreatePolicyBody, Policy } from "./policies/types.js";
 import { SpendPermission } from "./spend-permissions/types.js";
 
 dotenv.config();
+
+const LAMPORTS_PER_SOL = 1_000_000_000;
+
+/**
+ * Generates an Ed25519 key pair with extractable private key bytes.
+ * Node.js doesn't support exportKey("raw") for Ed25519 private keys;
+ * we export as JWK and decode the "d" field (base64url-encoded raw private key).
+ */
+async function generateExtractableSolanaKeyPair(): Promise<{
+  privKeyBytes: Uint8Array;
+  pubKeyBytes: Uint8Array;
+}> {
+  const keyPair = (await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const jwk = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
+  const privKeyBytes = Buffer.from(jwk.d!, "base64url");
+  const pubKeyBytes = new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey));
+  return { privKeyBytes, pubKeyBytes };
+}
 
 const testAccountName = "E2EServerAccount2";
 
@@ -107,10 +135,10 @@ async function ensureSufficientSolBalance(cdp: CdpClient, account: SolanaAccount
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  const connection = new Connection(
+  const rpc = createSolanaRpc(
     process.env.CDP_E2E_SOLANA_RPC_URL ?? "https://api.devnet.solana.com",
   );
-  let balance = await connection.getBalance(new PublicKey(account.address));
+  let balance = Number((await rpc.getBalance(solanaAddress(account.address)).send()).value);
 
   // 1250000 is the amount the faucet gives, and is plenty to cover gas
   // Increase to 12500000 to give us more buffer for testing transfers via sendTransaction.
@@ -127,7 +155,7 @@ async function ensureSufficientSolBalance(cdp: CdpClient, account: SolanaAccount
   const maxAttempts = 30;
 
   while (balance === 0 && attempts < maxAttempts) {
-    balance = await connection.getBalance(new PublicKey(account.address));
+    balance = Number((await rpc.getBalance(solanaAddress(account.address)).send()).value);
     if (balance === 0) {
       console.log("Waiting for funds...");
       await sleep(1000);
@@ -281,8 +309,8 @@ describe("CDP Client E2E Tests", () => {
   });
 
   it("should import an end user with a Solana private key (base58)", async () => {
-    const keypair = Keypair.generate();
-    const privateKey = bs58.encode(keypair.secretKey); // secretKey is 64 bytes
+    const { privKeyBytes, pubKeyBytes } = await generateExtractableSolanaKeyPair();
+    const privateKey = bs58.encode(Buffer.concat([privKeyBytes, pubKeyBytes])); // 64 bytes
     const randomEmail = `test-${Date.now()}@example.com`;
 
     const importEndUserOptions: Parameters<typeof cdp.endUser.importEndUser>[0] = {
@@ -303,15 +331,15 @@ describe("CDP Client E2E Tests", () => {
     expect(endUser.authenticationMethods).toHaveLength(1);
     expect(endUser.authenticationMethods[0].type).toBe("email");
     expect(endUser.solanaAccounts).toHaveLength(1);
-    expect(endUser.solanaAccounts[0]).toBe(keypair.publicKey.toBase58());
+    expect(endUser.solanaAccounts[0]).toBe(bs58.encode(pubKeyBytes));
     expect(endUser.createdAt).toBeDefined();
 
     logger.log("Imported end user with Solana key (base58):", safeStringify(endUser));
   });
 
   it("should import an end user with a Solana private key (raw bytes)", async () => {
-    const keypair = Keypair.generate();
-    const privateKeyBytes = keypair.secretKey; // This is a Uint8Array (64 bytes)
+    const { privKeyBytes, pubKeyBytes } = await generateExtractableSolanaKeyPair();
+    const privateKeyBytes = Buffer.concat([privKeyBytes, pubKeyBytes]); // 64 bytes
     const randomEmail = `test-${Date.now()}@example.com`;
 
     const importEndUserOptions: Parameters<typeof cdp.endUser.importEndUser>[0] = {
@@ -332,7 +360,7 @@ describe("CDP Client E2E Tests", () => {
     expect(endUser.authenticationMethods).toHaveLength(1);
     expect(endUser.authenticationMethods[0].type).toBe("email");
     expect(endUser.solanaAccounts).toHaveLength(1);
-    expect(endUser.solanaAccounts[0]).toBe(keypair.publicKey.toBase58());
+    expect(endUser.solanaAccounts[0]).toBe(bs58.encode(pubKeyBytes));
     expect(endUser.createdAt).toBeDefined();
 
     logger.log("Imported end user with Solana key (raw bytes):", safeStringify(endUser));
@@ -553,8 +581,9 @@ describe("CDP Client E2E Tests", () => {
 
   it("should import a solana account from a private key", async () => {
     // Test 1: Import from base58 encoded private key
-    const keypair = Keypair.generate();
-    const privateKey = bs58.encode(keypair.secretKey); // secretKey is 64 bytes
+    const { privKeyBytes: kp1PrivBytes, pubKeyBytes: kp1PubBytes } =
+      await generateExtractableSolanaKeyPair();
+    const privateKey = bs58.encode(Buffer.concat([kp1PrivBytes, kp1PubBytes])); // 64 bytes
     const randomName = generateRandomName();
 
     const importAccountOptions: ImportAccountOptions = {
@@ -590,8 +619,9 @@ describe("CDP Client E2E Tests", () => {
     expect(signature).toBeDefined();
 
     // Test 2: Import from raw bytes directly
-    const keypair2 = Keypair.generate();
-    const privateKeyBytes = keypair2.secretKey; // This is already a Uint8Array
+    const { privKeyBytes: kp2PrivBytes, pubKeyBytes: kp2PubBytes } =
+      await generateExtractableSolanaKeyPair();
+    const privateKeyBytes = Buffer.concat([kp2PrivBytes, kp2PubBytes]); // 64 bytes
     const randomName2 = generateRandomName();
 
     const importAccountOptions2: ImportAccountOptions = {
@@ -1120,8 +1150,6 @@ describe("CDP Client E2E Tests", () => {
     });
     expect(signedMessage).toBeDefined();
 
-    const accountPublicKey = new PublicKey(account.address);
-
     // Create a minimal valid transaction structure for the API
     const unsignedTxBytes = new Uint8Array([
       0, // Number of signatures (0 for unsigned)
@@ -1129,7 +1157,7 @@ describe("CDP Client E2E Tests", () => {
       0, // Number of read-only signed accounts
       0, // Number of read-only unsigned accounts
       1, // Number of account keys
-      ...accountPublicKey.toBuffer(),
+      ...bs58.decode(account.address),
       ...new Uint8Array(32).fill(1), // Recent blockhash (32 bytes)
       1, // Number of instructions
       0, // Program ID index
@@ -1774,7 +1802,7 @@ describe("CDP Client E2E Tests", () => {
 
     describe("send transaction", () => {
       it("should send a transaction", async () => {
-        const connection = new Connection(
+        const rpc = createSolanaRpc(
           process.env.CDP_E2E_SOLANA_RPC_URL ?? "https://api.devnet.solana.com",
         );
 
@@ -1789,23 +1817,40 @@ describe("CDP Client E2E Tests", () => {
 
         expect(signature).toBeDefined();
 
-        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+        await confirmTransaction(rpc, signature as Signature);
+      });
 
-        const confirmation = await connection.confirmTransaction(
-          {
-            signature,
-            blockhash,
-            lastValidBlockHeight,
-          },
-          "confirmed",
+      it("should send a fee-sponsored transaction", async () => {
+        const rpc = createSolanaRpc(
+          process.env.CDP_E2E_SOLANA_RPC_URL ?? "https://api.devnet.solana.com",
         );
 
-        expect(confirmation.value.err).toBeNull();
+        let signature: string | undefined;
+        try {
+          ({ signature } = await cdp.solana.sendTransaction({
+            network: "solana-devnet",
+            transaction: createAndEncodeTransaction(
+              testSolanaAccount.address,
+              "EeVPcnRE1mhcY85wAh3uPJG1uFiTNya9dCJjNUPABXzo",
+              10,
+            ),
+            useCdpSponsor: true,
+          }));
+        } catch (e) {
+          if (e instanceof APIError && e.statusCode === 429) {
+            return;
+          }
+          throw e;
+        }
+
+        expect(signature).toBeDefined();
+
+        await confirmTransaction(rpc, signature as Signature);
       });
     });
 
     describe("transfer", () => {
-      const connection = new Connection(
+      const rpc = createSolanaRpc(
         process.env.CDP_E2E_SOLANA_RPC_URL ?? "https://api.devnet.solana.com",
       );
 
@@ -1819,18 +1864,7 @@ describe("CDP Client E2E Tests", () => {
 
         expect(signature).toBeDefined();
 
-        const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-
-        const confirmation = await connection.confirmTransaction(
-          {
-            signature,
-            blockhash,
-            lastValidBlockHeight,
-          },
-          "confirmed",
-        );
-
-        expect(confirmation.value.err).toBeNull();
+        await confirmTransaction(rpc, signature as Signature);
       });
 
       it("should transfer USDC and wait for confirmation", async () => {
@@ -1844,18 +1878,7 @@ describe("CDP Client E2E Tests", () => {
 
           expect(signature).toBeDefined();
 
-          const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
-
-          const confirmation = await connection.confirmTransaction(
-            {
-              signature,
-              blockhash,
-              lastValidBlockHeight,
-            },
-            "confirmed",
-          );
-
-          expect(confirmation.value.err).toBeNull();
+          await confirmTransaction(rpc, signature as Signature);
         });
       });
     });
@@ -4193,7 +4216,9 @@ describe("CDP Client E2E Tests", () => {
       expect(rpcCalls.length).toBeGreaterThan(0);
 
       const rpcUrl = rpcCalls[0][0] as string;
-      expect(rpcUrl).toBe(optimismSepolia.rpcUrls.default.http[0]);
+      expect(rpcUrl.replace(/\/$/, "")).toBe(
+        optimismSepolia.rpcUrls.default.http[0].replace(/\/$/, ""),
+      );
 
       logger.log(`Optimism Sepolia RPC URL used: ${rpcUrl}`);
     } finally {
@@ -4285,31 +4310,60 @@ function generateRandomName(): string {
   return firstChar + middlePart + lastChar;
 }
 
+// Helper to poll for transaction confirmation
+async function confirmTransaction(
+  rpc: ReturnType<typeof createSolanaRpc>,
+  signature: Signature,
+): Promise<void> {
+  const maxAttempts = 30;
+  for (let i = 0; i < maxAttempts; i++) {
+    const result = await rpc.getSignatureStatuses([signature]).send();
+    const status = result.value[0];
+    if (
+      status !== null &&
+      (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized")
+    ) {
+      if (status.err !== null) {
+        throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+      }
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  throw new Error(`Transaction ${signature} not confirmed after ${maxAttempts} attempts`);
+}
+
 // Helper function to create and encode a Solana transaction
 function createAndEncodeTransaction(address: string, to?: string, amount?: number) {
-  const recipientAddress = to ? new PublicKey(to) : Keypair.generate().publicKey;
-
-  const fromPubkey = new PublicKey(address);
+  // Use a hardcoded fallback recipient if none provided
+  const recipientAddress = to ?? "EeVPcnRE1mhcY85wAh3uPJG1uFiTNya9dCJjNUPABXzo";
 
   // Covers the minimum amount of rent for a system account (0.00089088 SOL)
-  const transferAmount = amount !== undefined ? amount : 0.001 * LAMPORTS_PER_SOL;
-
-  const transaction = new Transaction().add(
-    SystemProgram.transfer({
-      fromPubkey,
-      toPubkey: recipientAddress,
-      lamports: transferAmount,
-    }),
+  const transferAmount = BigInt(
+    Math.round(amount !== undefined ? amount : 0.001 * LAMPORTS_PER_SOL),
   );
 
-  transaction.recentBlockhash = SYSVAR_RECENT_BLOCKHASHES_PUBKEY.toBase58();
-  transaction.feePayer = fromPubkey;
-
-  const serializedTransaction = transaction.serialize({
-    requireAllSignatures: false,
+  const instruction = getTransferSolInstruction({
+    source: createNoopSigner(solanaAddress(address)),
+    destination: solanaAddress(recipientAddress),
+    amount: transferAmount,
   });
 
-  return Buffer.from(serializedTransaction).toString("base64");
+  // Use a fake placeholder blockhash (same value web3.js v1 used via SYSVAR_RECENT_BLOCKHASHES_PUBKEY.toBase58())
+  const fakeBlockhash = "SysvarRecentB1ockHashes11111111111111111111" as Blockhash;
+
+  const txMsg = pipe(
+    createTransactionMessage({ version: 0 }),
+    tx => setTransactionMessageFeePayer(solanaAddress(address), tx),
+    tx =>
+      setTransactionMessageLifetimeUsingBlockhash(
+        { blockhash: fakeBlockhash, lastValidBlockHeight: 9999999n },
+        tx,
+      ),
+    tx => appendTransactionMessageInstructions([instruction], tx),
+  );
+
+  return getBase64EncodedWireTransaction(compileTransaction(txMsg));
 }
 
 /**

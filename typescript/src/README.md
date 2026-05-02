@@ -26,6 +26,15 @@
   - [Add EVM Smart Account to End User](#add-evm-smart-account-to-end-user)
   - [Add Solana Account to End User](#add-solana-account-to-end-user)
   - [Validate Access Token](#validate-access-token)
+- [Delegated Signing Operations](#delegated-signing-operations)
+  - [Revoke Delegation](#revoke-delegation)
+  - [EVM Signing](#evm-signing)
+  - [EVM Sending](#evm-sending)
+  - [EVM EIP-7702 Delegation](#evm-eip-7702-delegation)
+  - [Solana Signing](#solana-signing)
+  - [Solana Sending](#solana-sending)
+- [Webhooks](#webhooks)
+  - [Create Subscription](#create-subscription)
 - [Authentication tools](#authentication-tools)
 - [Error Reporting](#error-reporting)
 - [Usage Tracking](#usage-tracking)
@@ -378,37 +387,49 @@ import { CdpClient } from "@coinbase/cdp-sdk";
 import "dotenv/config";
 
 import {
-  PublicKey,
-  SystemProgram,
-  SYSVAR_RECENT_BLOCKHASHES_PUBKEY,
-  Transaction,
-} from "@solana/web3.js";
+  address as solanaAddress,
+  appendTransactionMessageInstructions,
+  compileTransaction,
+  createNoopSigner,
+  createSolanaRpc,
+  createTransactionMessage,
+  getBase64EncodedWireTransaction,
+  pipe,
+  setTransactionMessageFeePayer,
+  setTransactionMessageLifetimeUsingBlockhash,
+} from "@solana/kit";
+import { getTransferSolInstruction } from "@solana-program/system";
 
 const cdp = new CdpClient();
 
 const account = await cdp.solana.createAccount();
 
-const faucetResp = await cdp.solana.requestFaucet({
+await cdp.solana.requestFaucet({
   address: account.address,
   token: "sol",
 });
 
-const transaction = new Transaction();
-transaction.add(
-  SystemProgram.transfer({
-    fromPubkey: new PublicKey(account.address),
-    toPubkey: new PublicKey("3KzDtddx4i53FBkvCzuDmRbaMozTZoJBb1TToWhz3JfE"),
-    lamports: 10000,
-  })
+const rpc = createSolanaRpc("https://api.devnet.solana.com");
+const { value: { blockhash, lastValidBlockHeight } } = await rpc.getLatestBlockhash().send();
+
+const instruction = getTransferSolInstruction({
+  source: createNoopSigner(solanaAddress(account.address)),
+  destination: solanaAddress("3KzDtddx4i53FBkvCzuDmRbaMozTZoJBb1TToWhz3JfE"),
+  amount: 10000n,
+});
+
+const txMsg = pipe(
+  createTransactionMessage({ version: 0 }),
+  (tx) => setTransactionMessageFeePayer(solanaAddress(account.address), tx),
+  (tx) =>
+    setTransactionMessageLifetimeUsingBlockhash(
+      { blockhash, lastValidBlockHeight },
+      tx,
+    ),
+  (tx) => appendTransactionMessageInstructions([instruction], tx),
 );
 
-// A more recent blockhash is set in the backend by CDP
-transaction.recentBlockhash = SYSVAR_RECENT_BLOCKHASHES_PUBKEY.toBase58();
-transaction.feePayer = new PublicKey(account.address);
-
-const serializedTx = Buffer.from(
-  transaction.serialize({ requireAllSignatures: false })
-).toString("base64");
+const serializedTx = getBase64EncodedWireTransaction(compileTransaction(txMsg));
 
 console.log("Transaction serialized successfully");
 
@@ -418,8 +439,18 @@ const txResult = await cdp.solana.sendTransaction({
 });
 
 console.log(
-  `Transaction confirmed! Explorer link: https://explorer.solana.com/tx/${txResult.signature}?cluster=devnet`
+  `Transaction confirmed! Explorer link: https://explorer.solana.com/tx/${txResult.signature}?cluster=devnet`,
 );
+```
+
+To have CDP sponsor the transaction fees, pass `useCdpSponsor: true`. When enabled, CDP pays the network fee so the sender does not need SOL for fees.
+
+```typescript
+const txResult = await cdp.solana.sendTransaction({
+  network: "solana-devnet",
+  transaction: serializedTx,
+  useCdpSponsor: true,
+});
 ```
 
 ### EIP-7702 delegation
@@ -789,35 +820,27 @@ await sender.transfer({
 
 For complete examples, check out [solana/account.transfer.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/solana/account.transfer.ts).
 
-You can transfer tokens between accounts using the `transfer` function, and wait for the transaction to be confirmed using the `confirmTransaction` function from `@solana/web3.js`:
+You can transfer tokens between accounts using the `transfer` function:
 
 ```typescript
-import { LAMPORTS_PER_SOL } from "@solana/web3.js";
+import { createSolanaRpc, type Signature } from "@solana/kit";
 
 const sender = await cdp.solana.createAccount();
 
-const connection = new Connection("https://api.devnet.solana.com");
-
 const { signature } = await sender.transfer({
   to: "3KzDtddx4i53FBkvCzuDmRbaMozTZoJBb1TToWhz3JfE",
-  amount: 0.01 * LAMPORTS_PER_SOL,
+  amount: 10_000_000n, // 0.01 SOL in lamports
   token: "sol",
-  network: connection,
+  network: "devnet",
 });
 
-const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+// Poll for confirmation using @solana/kit
+const rpc = createSolanaRpc("https://api.devnet.solana.com");
+const result = await rpc.getSignatureStatuses([signature as Signature]).send();
+const status = result.value[0];
 
-const confirmation = await connection.confirmTransaction(
-  {
-    signature,
-    blockhash,
-    lastValidBlockHeight,
-  },
-  "confirmed",
-);
-
-if (confirmation.value.err) {
-  console.log(`Something went wrong! Error: ${confirmation.value.err.toString()}`);
+if (status?.err) {
+  console.log(`Something went wrong! Error: ${JSON.stringify(status.err)}`);
 } else {
   console.log(
     `Transaction confirmed: Link: https://explorer.solana.com/tx/${signature}?cluster=devnet`,
@@ -836,18 +859,18 @@ const { signature } = await sender.transfer({
 });
 ```
 
-If you want to use your own Connection, you can pass one to the `network` parameter:
+If you want to use your own RPC client, you can pass one to the `network` parameter:
 
 ```typescript
-import { Connection } from "@solana/web3.js";
+import { createSolanaRpc } from "@solana/kit";
 
-const connection = new Connection("YOUR_RPC_URL");
+const rpc = createSolanaRpc("YOUR_RPC_URL");
 
 const { signature } = await sender.transfer({
   to: "3KzDtddx4i53FBkvCzuDmRbaMozTZoJBb1TToWhz3JfE",
   amount: "0.01",
   token: "usdc",
-  network: connection,
+  network: rpc,
 });
 ```
 
@@ -1319,6 +1342,324 @@ try {
   // the access token is not valid or expired
 }
 ```
+
+## Delegated Signing Operations
+
+When an end user has granted a delegation, you can sign and send transactions on their behalf using the `cdp.endUser` client methods or directly on the `EndUserAccount` object.
+
+All delegated operations are available both as client methods (passing `userId` explicitly) and as convenience methods on the `EndUserAccount` object (where `userId` is automatically bound and `address` defaults to the first account if not specified).
+
+### Revoke Delegation
+
+Revoke all active delegations for an end user:
+
+```typescript
+// Using the client method
+await cdp.endUser.revokeDelegationForEndUser({
+  userId: "user-123",
+});
+
+// Or using the EndUser object
+const endUser = await cdp.endUser.getEndUser({ userId: "user-123" });
+await endUser.revokeDelegation();
+```
+
+For a complete example, see [end-users/revokeDelegation.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/end-users/revokeDelegation.ts).
+
+### EVM Signing
+
+#### Sign an EVM Transaction
+
+```typescript
+const result = await cdp.endUser.signEvmTransaction({
+  userId: "user-123",
+  address: "0x1234...",
+  transaction: "0x02...", // RLP-serialized EIP-1559 transaction, hex-encoded
+});
+console.log(result.signedTransaction);
+
+// Or using the EndUser object
+const result = await endUser.signEvmTransaction({
+  transaction: "0x02...",
+});
+console.log(result.signedTransaction);
+```
+
+#### Sign an EVM Message (EIP-191)
+
+```typescript
+const result = await cdp.endUser.signEvmMessage({
+  userId: "user-123",
+  address: "0x1234...",
+  message: "Hello, World!",
+});
+console.log(result.signature);
+
+// Or using the EndUser object
+const result = await endUser.signEvmMessage({
+  message: "Hello, World!",
+});
+console.log(result.signature);
+```
+
+#### Sign EVM Typed Data (EIP-712)
+
+```typescript
+const result = await cdp.endUser.signEvmTypedData({
+  userId: "user-123",
+  address: "0x1234...",
+  typedData: {
+    domain: { name: "Example" },
+    types: { Message: [{ name: "content", type: "string" }] },
+    primaryType: "Message",
+    message: { content: "Hello" },
+  },
+});
+console.log(result.signature);
+
+// Or using the EndUser object
+const result = await endUser.signEvmTypedData({
+  typedData: {
+    domain: { name: "Example" },
+    types: { Message: [{ name: "content", type: "string" }] },
+    primaryType: "Message",
+    message: { content: "Hello" },
+  },
+});
+console.log(result.signature);
+```
+
+### EVM Sending
+
+#### Send an EVM Transaction
+
+```typescript
+const result = await cdp.endUser.sendEvmTransaction({
+  userId: "user-123",
+  address: "0x1234...",
+  transaction: "0x02...", // RLP-serialized EIP-1559 transaction, hex-encoded
+  network: "base-sepolia",
+});
+console.log(result.transactionHash);
+
+// Or using the EndUser object
+const result = await endUser.sendEvmTransaction({
+  transaction: "0x02...",
+  network: "base-sepolia",
+});
+console.log(result.transactionHash);
+```
+
+For a complete example, see [end-users/sendEvmTransaction.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/end-users/sendEvmTransaction.ts).
+
+#### Send an EVM Asset
+
+Send tokens (e.g. USDC) on behalf of an end user:
+
+```typescript
+const result = await cdp.endUser.sendEvmAsset({
+  userId: "user-123",
+  address: "0x1234...",
+  to: "0xabcd...",
+  amount: "1000000",
+  network: "base-sepolia",
+  asset: "usdc", // optional, defaults to "usdc"
+  useCdpPaymaster: true, // optional
+});
+console.log(result.transactionHash);
+
+// Or using the EndUser object
+const result = await endUser.sendEvmAsset({
+  to: "0xabcd...",
+  amount: "1000000",
+  network: "base-sepolia",
+});
+console.log(result.transactionHash);
+```
+
+For a complete example, see [end-users/sendEvmAsset.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/end-users/sendEvmAsset.ts).
+
+#### Send a User Operation (Smart Account)
+
+Send a user operation via an end user's smart account:
+
+```typescript
+const result = await cdp.endUser.sendUserOperation({
+  userId: "user-123",
+  address: "0x1234...", // smart account address
+  network: "base-sepolia",
+  calls: [
+    {
+      to: "0xabcd...",
+      value: "0",
+      data: "0x",
+    },
+  ],
+  useCdpPaymaster: true,
+});
+
+// Or using the EndUser object (address defaults to the first smart account)
+const result = await endUser.sendUserOperation({
+  network: "base-sepolia",
+  calls: [
+    {
+      to: "0xabcd...",
+      value: "0",
+      data: "0x",
+    },
+  ],
+  useCdpPaymaster: true,
+});
+```
+
+For a complete example, see [end-users/sendUserOperation.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/end-users/sendUserOperation.ts).
+
+### EVM EIP-7702 Delegation
+
+Create an EIP-7702 delegation on behalf of an end user, upgrading their EOA with smart account capabilities:
+
+```typescript
+const result = await cdp.endUser.createEvmEip7702Delegation({
+  userId: "user-123",
+  address: "0x1234...",
+  network: "base-sepolia",
+  enableSpendPermissions: false, // optional
+});
+console.log(result.delegationOperationId);
+
+// Or using the EndUser object
+const result = await endUser.createEvmEip7702Delegation({
+  network: "base-sepolia",
+});
+console.log(result.delegationOperationId);
+```
+
+For a complete example, see [end-users/createEvmEip7702Delegation.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/end-users/createEvmEip7702Delegation.ts).
+
+### Solana Signing
+
+#### Sign a Solana Message
+
+```typescript
+const result = await cdp.endUser.signSolanaMessage({
+  userId: "user-123",
+  address: "So1ana...",
+  message: "base64message...",
+});
+console.log(result.signature);
+
+// Or using the EndUser object
+const result = await endUser.signSolanaMessage({
+  message: "base64message...",
+});
+console.log(result.signature);
+```
+
+For a complete example, see [end-users/signSolanaMessage.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/end-users/signSolanaMessage.ts).
+
+#### Sign a Solana Transaction
+
+```typescript
+const result = await cdp.endUser.signSolanaTransaction({
+  userId: "user-123",
+  address: "So1ana...",
+  transaction: "base64tx...",
+});
+console.log(result.signedTransaction);
+
+// Or using the EndUser object
+const result = await endUser.signSolanaTransaction({
+  transaction: "base64tx...",
+});
+console.log(result.signedTransaction);
+```
+
+### Solana Sending
+
+#### Send a Solana Transaction
+
+```typescript
+const result = await cdp.endUser.sendSolanaTransaction({
+  userId: "user-123",
+  address: "So1ana...",
+  transaction: "base64tx...",
+  network: "solana-devnet",
+});
+console.log(result.transactionSignature);
+
+// Or using the EndUser object
+const result = await endUser.sendSolanaTransaction({
+  transaction: "base64tx...",
+  network: "solana-devnet",
+});
+console.log(result.transactionSignature);
+```
+
+#### Send a Solana Asset
+
+```typescript
+const result = await cdp.endUser.sendSolanaAsset({
+  userId: "user-123",
+  address: "So1ana...",
+  to: "Recipi...",
+  amount: "1000000",
+  network: "solana-devnet",
+  asset: "usdc", // optional, defaults to "usdc"
+  createRecipientAta: true, // optional, creates recipient's associated token account
+});
+console.log(result.transactionSignature);
+
+// Or using the EndUser object
+const result = await endUser.sendSolanaAsset({
+  to: "Recipi...",
+  amount: "1000000",
+  network: "solana-devnet",
+});
+console.log(result.transactionSignature);
+```
+
+## Webhooks
+
+You can use the webhooks SDK to subscribe to on-chain and wallet events and receive notifications at a URL of your choice.
+
+### Create Subscription
+
+Create a webhook subscription to receive event notifications:
+
+```typescript
+const subscription = await cdp.webhooks.createSubscription({
+  description: "Monitor wallet transactions",
+  eventTypes: [
+    "wallet.transaction.pending",
+    "wallet.transaction.confirmed",
+    "wallet.transaction.failed",
+  ],
+  targetUrl: "https://example.com/webhook",
+  targetHeaders: { "X-Custom-Header": "custom-value" }, // optional
+  isEnabled: true, // optional, defaults to true
+  metadata: { env: "production" }, // optional
+});
+
+console.log("Subscription ID:", subscription.subscriptionId);
+console.log("Secret:", subscription.secret); // use to verify webhook signatures
+```
+
+The available wallet event types are:
+
+- `wallet.transaction.created`
+- `wallet.transaction.broadcast`
+- `wallet.transaction.pending`
+- `wallet.transaction.replaced`
+- `wallet.transaction.confirmed`
+- `wallet.transaction.failed`
+- `wallet.transaction.signed`
+- `wallet.typed_data.signed`
+- `wallet.message.signed`
+- `wallet.hash.signed`
+- `wallet.delegation.created`
+- `wallet.delegation.revoked`
+
+For a complete working example, see [webhooks/createWebhookSubscription.ts](https://github.com/coinbase/cdp-sdk/blob/main/examples/typescript/webhooks/createWebhookSubscription.ts).
 
 ## Authentication tools
 
